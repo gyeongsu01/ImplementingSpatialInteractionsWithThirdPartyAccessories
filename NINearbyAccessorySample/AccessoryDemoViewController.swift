@@ -81,6 +81,19 @@ class AccessoryDemoViewController: UIViewController {
     
     // MARK: - 데이터 채널 메서드
     
+    // 추가 메시지 ID (BLE 시뮬레이션에서 사용)
+    private enum SimulatedMessageType: UInt8 {
+        case distanceData = 0xD0    // 거리 데이터 메시지
+    }
+    
+    // BLE를 통한 거리 데이터 구조체
+    private struct DistanceData {
+        var messageType: UInt8      // 메시지 유형 (0xD0)
+        var distance: Float         // 거리 (미터)
+        var signalStrength: Int8    // 신호 강도 (dBm)
+        var status: UInt8           // 상태 (0: 정상, 1: 오류)
+    }
+    
     // 액세서리에서 공유된 데이터 처리
     func accessorySharedData(data: Data, accessoryName: String) {
         // 각 메시지는 식별자 바이트로 시작합니다.
@@ -90,28 +103,72 @@ class AccessoryDemoViewController: UIViewController {
             return
         }
         
-        // 첫 번째 바이트를 메시지 식별자로 할당합니다.
-        guard let messageId = MessageId(rawValue: data.first!) else {
-            fatalError("\(data.first!)은(는) 유효한 MessageId가 아닙니다.")
+        // 첫 번째 바이트 확인
+        let firstByte = data.first!
+        
+        // 표준 MessageId인지 확인
+        if let messageId = MessageId(rawValue: firstByte) {
+            // 표준 메시지 처리
+            switch messageId {
+            case .accessoryConfigurationData:
+                // 메시지 식별자를 건너뛰어 메시지 데이터에 접근합니다.
+                assert(data.count > 1)
+                let message = data.advanced(by: 1)
+                setupAccessory(message, name: accessoryName)
+            case .accessoryUwbDidStart:
+                handleAccessoryUwbDidStart()
+            case .accessoryUwbDidStop:
+                handleAccessoryUwbDidStop()
+            case .configureAndStart:
+                fatalError("액세서리는 'configureAndStart'를 보내면 안됩니다.")
+            case .initialize:
+                fatalError("액세서리는 'initialize'를 보내면 안됩니다.")
+            case .stop:
+                fatalError("액세서리는 'stop'을 보내면 안됩니다.")
+            }
+        } 
+        // 시뮬레이션 메시지인지 확인
+        else if firstByte == SimulatedMessageType.distanceData.rawValue {
+            // 거리 데이터 메시지 처리
+            handleSimulatedDistanceData(data)
+        }
+        else {
+            logger.error("\(firstByte)은(는) 알 수 없는 메시지 유형입니다.")
+        }
+    }
+    
+    // 시뮬레이션된 거리 데이터 처리
+    private func handleSimulatedDistanceData(_ data: Data) {
+        // 구조체 크기만큼의 데이터가 있는지 확인
+        guard data.count >= MemoryLayout<DistanceData>.size else {
+            updateInfoLabel(with: "거리 데이터 길이가 너무 짧습니다.")
+            return
         }
         
-        // 메시지 식별자에 따라 메시지의 데이터 부분을 처리합니다.
-        switch messageId {
-        case .accessoryConfigurationData:
-            // 메시지 식별자를 건너뛰어 메시지 데이터에 접근합니다.
-            assert(data.count > 1)
-            let message = data.advanced(by: 1)
-            setupAccessory(message, name: accessoryName)
-        case .accessoryUwbDidStart:
-            handleAccessoryUwbDidStart()
-        case .accessoryUwbDidStop:
-            handleAccessoryUwbDidStop()
-        case .configureAndStart:
-            fatalError("액세서리는 'configureAndStart'를 보내면 안됩니다.")
-        case .initialize:
-            fatalError("액세서리는 'initialize'를 보내면 안됩니다.")
-        case .stop:
-            fatalError("액세서리는 'stop'을 보내면 안됩니다.")
+        // 데이터를 DistanceData 구조체로 변환
+        var distanceData = DistanceData(messageType: 0, distance: 0, signalStrength: 0, status: 0)
+        data.withUnsafeBytes { rawBufferPointer in
+            distanceData = rawBufferPointer.load(as: DistanceData.self)
+        }
+        
+        // 상태 확인
+        if distanceData.status != 0 {
+            updateInfoLabel(with: "거리 측정 오류 (상태: \(distanceData.status))")
+            return
+        }
+        
+        // 거리 정보 업데이트
+        let distanceStr = String(format: "'%@'까지의 거리: %.1f 미터 (BLE 시뮬레이션)", 
+                                 connectedAccessoryName ?? "액세서리", 
+                                 distanceData.distance)
+        
+        // 거리 레이블 업데이트
+        self.distanceLabel.text = distanceStr
+        self.distanceLabel.sizeToFit()
+        
+        // UWB가 꺼져있을 때만 정보 레이블 업데이트
+        if uwbStateLabel.text == "꺼짐" {
+            updateInfoLabel(with: "BLE 시뮬레이션 모드: 실시간 거리 \(String(format: "%.2f", distanceData.distance)) 미터")
         }
     }
     
@@ -138,20 +195,85 @@ class AccessoryDemoViewController: UIViewController {
     // 액세서리 설정 - 구성 데이터 수신 후 NI 세션 시작
     func setupAccessory(_ configData: Data, name: String) {
         updateInfoLabel(with: "'\(name)'에서 구성 데이터를 수신했습니다. 세션을 실행합니다.")
+        
+        // 디버깅을 위해 수신된 구성 데이터 로깅
+        let dataString = configData.map { String(format: "0x%02x, ", $0) }.joined()
+        logger.info("수신된 구성 데이터 (총 \(configData.count)바이트): \(dataString)")
+        
+        // 구성 형식 확인 (디버깅용)
+        checkConfigurationFormat(configData)
+        
         do {
             // 수신된 구성 데이터로 NINearbyAccessoryConfiguration 생성
             configuration = try NINearbyAccessoryConfiguration(data: configData)
+            logger.info("NINearbyAccessoryConfiguration 생성 성공")
+            
+            // 이 액세서리의 업데이트를 상호 연관시키기 위해 토큰을 캐시합니다.
+            cacheToken(configuration!.accessoryDiscoveryToken, accessoryName: name)
+            
+            // NI 세션 시작
+            logger.info("NI 세션 시작 중...")
+            niSession.run(configuration!)
+            logger.info("NI 세션 실행 완료")
         } catch {
             // 수신 데이터가 잘못되었기 때문에 중지하고 문제를 표시합니다.
-            // 앱에서는 예상 형식에 맞게 액세서리 데이터를 디버깅하세요.
-            updateInfoLabel(with: "'\(name)'에 대한 NINearbyAccessoryConfiguration 생성 실패. 오류: \(error)")
+            let errorDescription = error.localizedDescription
+            let errorInfo = (error as NSError).userInfo
+            
+            // 자세한 오류 정보 로깅
+            logger.error("구성 생성 실패 오류: \(error)")
+            logger.error("오류 세부정보: \(errorInfo)")
+            
+            // 사용자에게 오류 표시
+            updateInfoLabel(with: "'\(name)'에 대한 NINearbyAccessoryConfiguration 생성 실패. 오류: \(errorDescription)")
+            
+            // BLE 시뮬레이션 모드 활성화 알림
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.updateInfoLabel(with: "UWB 구성 실패. BLE 기반 시뮬레이션 모드로 전환됩니다.")
+            }
+            return
+        }
+    }
+    
+    // 구성 데이터 형식 체크 (디버깅용)
+    private func checkConfigurationFormat(_ data: Data) {
+        // 데이터 길이 확인
+        guard data.count > 4 else {
+            logger.error("구성 데이터가 너무 짧습니다: \(data.count) 바이트")
             return
         }
         
-        // 이 액세서리의 업데이트를 상호 연관시키기 위해 토큰을 캐시합니다.
-        cacheToken(configuration!.accessoryDiscoveryToken, accessoryName: name)
-        // NI 세션 시작
-        niSession.run(configuration!)
+        // 첫 4바이트가 "UWB1" 매직 스트링인지 확인
+        if data.count >= 4 {
+            let firstFourBytes = data.prefix(4)
+            if let magicString = String(data: firstFourBytes, encoding: .ascii) {
+                logger.info("매직 스트링: \(magicString)")
+                
+                if magicString == "UWB1" {
+                    logger.info("UWB1 형식 감지됨, 유효한 형식일 수 있음")
+                }
+            }
+        }
+        
+        // 데이터 시작 부분에 다른 특징적인 패턴이 있는지 확인
+        if data.count >= 2 {
+            let firstTwoBytes = [data[0], data[1]]
+            logger.info("첫 2바이트: 0x\(String(format: "%02X%02X", firstTwoBytes[0], firstTwoBytes[1]))")
+            
+            // FiRa 컨소시엄 ID 패턴 확인
+            if data.count >= 20 {
+                if data[18] == 0x0D && data[19] == 0xF0 {
+                    logger.info("FiRa 블록 ID (0x0DF0) 감지됨, 위치 18에서")
+                }
+                
+                // 또 다른 가능한 식별자 패턴 확인
+                for i in 0..<data.count-1 {
+                    if data[i] == 0x2D && data[i+1] == 0x01 {
+                        logger.info("U2 프로토콜 ID (0x2D01) 감지됨, 위치 \(i)에서")
+                    }
+                }
+            }
+        }
     }
     
     // 액세서리 UWB 세션 시작 처리
